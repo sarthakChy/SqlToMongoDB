@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:14
+    container_name: sql-query-optimizer-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: "TPC-H"
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/data:/data:ro
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+
+  backend:
+    build:
+      context: .
+      dockerfile: ./server/Dockerfile
+    container_name: sql-query-optimizer-backend
+    depends_on:
+      - db
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: "TPC-H"
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      PORT: 5000
+    ports:
+      - "5001:5000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: ./frontend/Dockerfile
+    container_name: sql-query-optimizer-frontend
+    depends_on:
+      - backend
+    ports:
+      - "3001:80"
+
+volumes:
+  pgdata:

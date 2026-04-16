@@ -18,7 +18,8 @@
     "test": "npm test --workspace sql-query-optimizer-frontend"
   },
   "devDependencies": {
-    "babel-preset-react-app": "10.0.0",
+    "@babel/core": "^7.29.0",
+    "ajv": "^8.17.1",
     "concurrently": "^9.1.2"
   }
 }

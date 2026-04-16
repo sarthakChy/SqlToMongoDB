@@ -3,6 +3,39 @@ picasso2.1/
 picasso/
 data/
 
+# Project-generated data and builds
+db/data/
+frontend/build/
+server/dist/
+dist/
+
+# Local dependencies and package manager state
+node_modules/
+frontend/node_modules/
+server/node_modules/
+.npm/
+
+# Container/runtime artifacts
+docker-compose.override.yml
+docker-compose.override.yaml
+*.pid
+*.seed
+*.lock
+
+# Local environment files
+.env
+.env.*
+server/.env
+frontend/.env
+
+# Local scratch outputs
+*.log
+*.tmp
+*.temp
+ql -d postgres -Atc select datname from pg_database where datname = 'TPC-H';
+ql -d postgres -c \\l
+t { execSync } = require('node:child_process');
+
 # Ignore editor
 .vscode
 
