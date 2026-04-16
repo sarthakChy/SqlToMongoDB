@@ -91,10 +91,6 @@ const FormOutput = (props) => {
   const renderSqlToMongo = () => {
     const conversion = props.output["sqlToMongo"];
 
-    if (props.output["error"]) {
-      return <div className={styles.explanationLoadingWrapper}>No data to show</div>;
-    }
-
     if (!conversion) {
       return <div className={styles.explanationLoadingWrapper}>No conversion available</div>;
     }

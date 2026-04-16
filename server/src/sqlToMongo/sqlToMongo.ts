@@ -63,6 +63,29 @@ function literalToValue(node: any): any {
   return null;
 }
 
+function isStarColumnRef(node: any): boolean {
+  return node?.type === "column_ref" && getColumnName(node) === "*";
+}
+
+function containsWindowFunctionNode(node: any): boolean {
+  if (!node) return false;
+  if (Array.isArray(node)) return node.some((item) => containsWindowFunctionNode(item));
+  if (typeof node !== "object") return false;
+  if (node.type === "window_func") return true;
+
+  return Object.values(node).some((value) => containsWindowFunctionNode(value));
+}
+
+function hasStarOnlySelect(stmt: any): boolean {
+  const selectColumns = Array.isArray(stmt?.columns) ? stmt.columns : [];
+  return selectColumns.length > 0 && selectColumns.every((col: any) => isStarColumnRef(col?.expr));
+}
+
+function exprListToMongoValues(node: any, aggFieldBySignature?: Map<string, string>): any[] {
+  const values = Array.isArray(node?.value) ? node.value : [];
+  return values.map((value: any) => exprToMongoExpr(value, aggFieldBySignature));
+}
+
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -133,11 +156,36 @@ function exprToMongoExpr(node: any, aggFieldBySignature?: Map<string, string>): 
 function boolToMongoExpr(node: any, aggFieldBySignature?: Map<string, string>): any {
   if (!node) return true;
 
+  if (node.type === "function") {
+    const name = node?.name?.name;
+    const functionName = Array.isArray(name) && name[0] ? String(name[0].value ?? "").toUpperCase() : "";
+
+    if (functionName === "NOT") {
+      const arg = node?.args?.value?.[0];
+      if (!arg) throw new Error("NOT requires an argument");
+      return { $not: [boolToMongoExpr(arg, aggFieldBySignature)] };
+    }
+
+    throw new Error(`Unsupported boolean function: ${functionName || String(node.type)}`);
+  }
+
   if (node.type === "binary_expr") {
     const op = String(node.operator).toUpperCase();
 
     if (op === "AND") return { $and: [boolToMongoExpr(node.left, aggFieldBySignature), boolToMongoExpr(node.right, aggFieldBySignature)] };
     if (op === "OR") return { $or: [boolToMongoExpr(node.left, aggFieldBySignature), boolToMongoExpr(node.right, aggFieldBySignature)] };
+
+    if (op === "BETWEEN") {
+      const bounds = Array.isArray(node.right?.value) ? node.right.value : [];
+      if (bounds.length !== 2) throw new Error("BETWEEN requires two bounds");
+
+      return {
+        $and: [
+          { $gte: [exprToMongoExpr(node.left, aggFieldBySignature), exprToMongoExpr(bounds[0], aggFieldBySignature)] },
+          { $lte: [exprToMongoExpr(node.left, aggFieldBySignature), exprToMongoExpr(bounds[1], aggFieldBySignature)] },
+        ],
+      };
+    }
 
     if (["=", "=="].includes(op)) return { $eq: [exprToMongoExpr(node.left, aggFieldBySignature), exprToMongoExpr(node.right, aggFieldBySignature)] };
     if (["!=", "<>"].includes(op)) return { $ne: [exprToMongoExpr(node.left, aggFieldBySignature), exprToMongoExpr(node.right, aggFieldBySignature)] };
@@ -145,6 +193,24 @@ function boolToMongoExpr(node: any, aggFieldBySignature?: Map<string, string>): 
     if (op === ">=") return { $gte: [exprToMongoExpr(node.left, aggFieldBySignature), exprToMongoExpr(node.right, aggFieldBySignature)] };
     if (op === "<") return { $lt: [exprToMongoExpr(node.left, aggFieldBySignature), exprToMongoExpr(node.right, aggFieldBySignature)] };
     if (op === "<=") return { $lte: [exprToMongoExpr(node.left, aggFieldBySignature), exprToMongoExpr(node.right, aggFieldBySignature)] };
+
+    if (op === "IN") {
+      return { $in: [exprToMongoExpr(node.left, aggFieldBySignature), exprListToMongoValues(node.right, aggFieldBySignature)] };
+    }
+
+    if (op === "NOT IN") {
+      return { $not: [{ $in: [exprToMongoExpr(node.left, aggFieldBySignature), exprListToMongoValues(node.right, aggFieldBySignature)] }] };
+    }
+
+    if (op === "IS") {
+      if (node.right?.type !== "null") throw new Error(`Unsupported IS comparison: ${op}`);
+      return { $eq: [exprToMongoExpr(node.left, aggFieldBySignature), null] };
+    }
+
+    if (op === "IS NOT") {
+      if (node.right?.type !== "null") throw new Error(`Unsupported IS comparison: ${op}`);
+      return { $ne: [exprToMongoExpr(node.left, aggFieldBySignature), null] };
+    }
 
     if (op === "LIKE") {
       const input = exprToMongoExpr(node.left, aggFieldBySignature);
@@ -453,6 +519,10 @@ function buildGroupAndProject(
     const exprNode = col?.expr ?? col?.expr?.expr ?? col?.expr;
     const alias = col?.as ?? null;
 
+    if (isStarColumnRef(exprNode)) {
+      continue;
+    }
+
     // Column ref without alias
     if (exprNode?.type === "column_ref") {
       const name = getColumnName(exprNode);
@@ -465,6 +535,7 @@ function buildGroupAndProject(
   }
 
   pipeline.push({ $project: project });
+  pipeline.push({ $unset: "_id" });
 
   return pipeline;
 }
@@ -593,75 +664,185 @@ function buildPipelineForHavingScalarSubquery(stmt: any, baseTable: string): Mon
   return combined;
 }
 
+function buildSelectTranslation(stmt: any, includeTail = true): SqlToMongoResult {
+  if (containsWindowFunctionNode(stmt)) {
+    return { error: "Window functions are not supported for SQL→Mongo conversion yet." };
+  }
+
+  const fromTables = Array.isArray(stmt.from) ? stmt.from.map((f: any) => String(f.table)) : [];
+  if (fromTables.length === 0) {
+    return { error: "No FROM tables found." };
+  }
+
+  const baseTable = fromTables[0];
+
+  if (hasScalarSubqueryHaving(stmt)) {
+    return {
+      collection: baseTable,
+      pipeline: buildPipelineForHavingScalarSubquery(stmt, baseTable),
+    };
+  }
+
+  const { joins, exists, filters } = splitWhereConjuncts(stmt.where);
+
+  const joinPipeline = buildJoinPipeline(baseTable, fromTables, joins);
+  const existsStages = buildExistsStages(exists);
+
+  const filterExpr =
+    filters.length === 0
+      ? null
+      : filters.length === 1
+        ? boolToMongoExpr(filters[0])
+        : { $and: filters.map((f) => boolToMongoExpr(f)) };
+
+  const needsGroup = Boolean(stmt.groupby) || (stmt.columns ?? []).some((c: any) => {
+    const aggregates = new Map<string, any>();
+    collectAggregates(c?.expr ?? c?.expr?.expr, aggregates);
+    return aggregates.size > 0;
+  });
+
+  let pipeline: MongoPipeline;
+  if (needsGroup) {
+    pipeline = buildGroupAndProject(stmt, filterExpr, [...joinPipeline, ...existsStages]);
+  } else {
+    pipeline = [...joinPipeline, ...existsStages];
+    if (filterExpr) pipeline.push({ $match: { $expr: filterExpr } });
+
+    const selectColumns = Array.isArray(stmt.columns) ? stmt.columns : [];
+    const hasWildcardSelect = selectColumns.some((col: any) => isStarColumnRef(col?.expr));
+    const project: any = {};
+    for (const col of selectColumns) {
+      const exprNode = col?.expr;
+      const alias = col?.as ?? null;
+
+      if (isStarColumnRef(exprNode)) {
+        continue;
+      }
+
+      if (exprNode?.type === "column_ref") {
+        const name = getColumnName(exprNode);
+        project[alias ?? name] = `$${name}`;
+      } else {
+        const outName = alias ?? `expr_${Object.keys(project).length}`;
+        project[outName] = exprToMongoExpr(exprNode);
+      }
+    }
+    if (!hasWildcardSelect && Object.keys(project).length > 0) {
+      pipeline.push({ $project: project });
+    } else if (hasWildcardSelect && Object.keys(project).length > 0) {
+      pipeline.push({ $addFields: project });
+    }
+
+    pipeline.push({ $unset: "_id" });
+  }
+
+  if (includeTail) {
+    pipeline.push(...buildSortAndLimit(stmt));
+  }
+
+  return { collection: baseTable, pipeline };
+}
+
+function buildSimpleCteTranslation(stmt: any): SqlToMongoResult | null {
+  if (!Array.isArray(stmt?.with) || stmt.with.length !== 1) {
+    return null;
+  }
+
+  const cte = stmt.with[0];
+  const cteName = String(cte?.name?.value ?? "");
+  const cteStmt = cte?.stmt;
+
+  if (!cteName || !cteStmt || cteStmt.type !== "select") {
+    return { error: "CTE queries are not supported for this SQL shape yet." };
+  }
+
+  const fromTables = Array.isArray(stmt.from) ? stmt.from.map((f: any) => String(f.table)) : [];
+  const outerFromMatchesCte = fromTables.length === 1 && fromTables[0] === cteName;
+
+  if (!outerFromMatchesCte || stmt.where || stmt.groupby || stmt.having || stmt._next || stmt.set_op) {
+    return { error: "CTE queries are only supported when the outer query directly selects from a single CTE." };
+  }
+
+  if (!hasStarOnlySelect(stmt)) {
+    return { error: "CTE queries are only supported with SELECT * in the outer query for now." };
+  }
+
+  const innerResult = buildSelectTranslation(cteStmt, false);
+  if ("error" in innerResult) {
+    return innerResult;
+  }
+
+  return {
+    collection: innerResult.collection,
+    pipeline: [...innerResult.pipeline, ...buildSortAndLimit(stmt)],
+  };
+}
+
+function buildUnionTranslation(stmt: any): SqlToMongoResult | null {
+  if (String(stmt?.set_op ?? "").toLowerCase() !== "union" || !stmt?._next) {
+    return null;
+  }
+
+  if (stmt.with || stmt._next.with) {
+    return { error: "CTEs inside UNION queries are not supported yet." };
+  }
+
+  const leftResult = buildSelectTranslation({ ...stmt, _next: undefined, set_op: null }, false);
+  if ("error" in leftResult) {
+    return leftResult;
+  }
+
+  const rightResult = buildSelectTranslation(stmt._next, false);
+  if ("error" in rightResult) {
+    return rightResult;
+  }
+
+  return {
+    collection: leftResult.collection,
+    pipeline: [
+      ...leftResult.pipeline,
+      {
+        $unionWith: {
+          coll: rightResult.collection,
+          pipeline: rightResult.pipeline,
+        },
+      },
+      {
+        $group: {
+          _id: "$$ROOT",
+        },
+      },
+      { $replaceRoot: { newRoot: "$_id" } },
+      ...buildSortAndLimit(stmt),
+    ],
+  };
+}
+
 export function sqlToMongo(sql: string): SqlToMongoResult {
   try {
     const parser = new Parser();
     const ast = parser.astify(sql, { database: "postgresql" });
     const stmt = Array.isArray(ast) ? ast[0] : ast;
 
+    if (Array.isArray(ast) && ast.length > 1) {
+      return { error: "Only a single SQL statement is supported for SQL→Mongo conversion." };
+    }
+
     if (!stmt || stmt.type !== "select") {
       return { error: "Only SELECT queries are supported for SQL→Mongo conversion." };
     }
 
-    const fromTables = Array.isArray(stmt.from) ? stmt.from.map((f: any) => String(f.table)) : [];
-    if (fromTables.length === 0) {
-      return { error: "No FROM tables found." };
+    const cteTranslation = buildSimpleCteTranslation(stmt);
+    if (cteTranslation) {
+      return cteTranslation;
     }
 
-    const baseTable = fromTables[0];
-
-    if (hasScalarSubqueryHaving(stmt)) {
-      return {
-        collection: baseTable,
-        pipeline: buildPipelineForHavingScalarSubquery(stmt, baseTable),
-      };
+    const unionTranslation = buildUnionTranslation(stmt);
+    if (unionTranslation) {
+      return unionTranslation;
     }
 
-    const { joins, exists, filters } = splitWhereConjuncts(stmt.where);
-
-    const joinPipeline = buildJoinPipeline(baseTable, fromTables, joins);
-    const existsStages = buildExistsStages(exists);
-
-    const filterExpr =
-      filters.length === 0
-        ? null
-        : filters.length === 1
-          ? boolToMongoExpr(filters[0])
-          : { $and: filters.map((f) => boolToMongoExpr(f)) };
-
-    const needsGroup = Boolean(stmt.groupby) || (stmt.columns ?? []).some((c: any) => {
-      const aggregates = new Map<string, any>();
-      collectAggregates(c?.expr ?? c?.expr?.expr, aggregates);
-      return aggregates.size > 0;
-    });
-
-    let pipeline: MongoPipeline;
-    if (needsGroup) {
-      pipeline = buildGroupAndProject(stmt, filterExpr, [...joinPipeline, ...existsStages]);
-    } else {
-      pipeline = [...joinPipeline, ...existsStages];
-      if (filterExpr) pipeline.push({ $match: { $expr: filterExpr } });
-
-      // Simple projection (no group)
-      const project: any = {};
-      for (const col of stmt.columns ?? []) {
-        const exprNode = col?.expr;
-        const alias = col?.as ?? null;
-
-        if (exprNode?.type === "column_ref") {
-          const name = getColumnName(exprNode);
-          project[alias ?? name] = `$${name}`;
-        } else {
-          const outName = alias ?? `expr_${Object.keys(project).length}`;
-          project[outName] = exprToMongoExpr(exprNode);
-        }
-      }
-      pipeline.push({ $project: project });
-    }
-
-    pipeline.push(...buildSortAndLimit(stmt));
-
-    return { collection: baseTable, pipeline };
+    return buildSelectTranslation(stmt);
   } catch (e: any) {
     return { error: e?.message ?? "Unable to convert SQL to MongoDB." };
   }
