@@ -2,21 +2,6 @@
 
 SQL Query Optimizer is a web app that takes TPC-H-style SQL, converts it to a MongoDB aggregation pipeline, and compares PostgreSQL execution plans. The frontend lets you paste a query, inspect the generated MongoDB translation, and review query-plan explanations and graphs from the optimizer backend.
 
-## Quick Start
-
-1. Install dependencies with `npm install`.
-2. Create `server/.env` for your PostgreSQL setup.
-3. Verify the database connection with `psql`.
-4. Start everything with `npm run dev`.
-
-When the app is up, open the UI at http://localhost:3000 and the API at http://localhost:5000. For the full setup flow, use the detailed steps below.
-
-This repository is structured as an npm workspaces monorepo:
-
-- `frontend` - React UI for query input, plan comparison, and SQL-to-Mongo output
-- `server` - Express + TypeScript API that runs SQL parsing, translation, and PostgreSQL EXPLAIN analysis
-- `db` - PostgreSQL schema and loader scripts for the TPC-H dataset
-- `docs` - setup notes, query samples, and conversion smoke results
 
 ## What the project does
 
@@ -62,27 +47,6 @@ See [docs/sql-to-mongo-support.md](docs/sql-to-mongo-support.md) for the detaile
 
 The project has been validated on Linux with a local PostgreSQL server reachable over the Unix socket.
 
-## Docker Setup
-
-You can run the entire stack with Docker as well. This brings up:
-
-- PostgreSQL with the TPC-H schema loaded automatically after you generate the CSV files in `db/data/`
-- The backend API on port 5000
-- The frontend UI on port 3000
-
-Start it from the repository root:
-
-```bash
-docker-compose up --build
-```
-
-After the containers are healthy, open:
-
-- UI: http://localhost:3001
-- API: http://localhost:5001
-- PostgreSQL: localhost:55432
-
-The repository includes everything needed to regenerate the TPC-H CSVs locally. Use the bundled generator script to populate `db/data/` before starting Docker or running the load scripts. If any required CSV is missing, the database container fails fast during initialization.
 
 ## Quick Start
 
@@ -128,7 +92,7 @@ If your setup uses local peer authentication, replace the connection string with
 
 4. Generate the TPC-H CSV files into `db/data/`.
 
-The repository vendors the TPC-H generator source under `db/tpch-dbgen/`, so you can build and run it without using a second repository:
+The repository vendors the TPC-H generator source under `db/tpch-dbgen/`
 
 ```bash
 npm run generate:tpch-data
@@ -178,6 +142,30 @@ Typical flow:
 2. Run `npm run generate:tpch-data` to generate the SF1 `.tbl` files and convert them to CSVs in `db/data/`.
 3. Run the load commands from the quick start section.
 
+## Docker Setup
+
+The repository includes everything needed to regenerate the TPC-H CSVs locally. Use the bundled generator script to populate `db/data/` before starting Docker or running the load scripts. If any required CSV is missing, the database container fails fast during initialization.
+
+You can run the entire stack with Docker as well. This brings up:
+
+- PostgreSQL with the TPC-H schema loaded automatically after you generate the CSV files in `db/data/`
+- The backend API on port 5000
+- The frontend UI on port 3000
+
+Start it from the repository root:
+
+```bash
+docker-compose up --build
+```
+
+After the containers are healthy, open:
+
+- UI: http://localhost:3001
+- API: http://localhost:5001
+- PostgreSQL: localhost:55432
+
+
+
 ## Example queries
 
 Use the browser UI with the queries in [docs/query-samples.md](docs/query-samples.md). A few good starting points:
@@ -202,41 +190,3 @@ WITH t AS (
 SELECT *
 FROM t;
 ```
-
-## Verification
-
-You can confirm the app is running end to end with:
-
-```bash
-ss -ltn | grep ':3000\|:5000'
-```
-
-And by sending a smoke test request to the API:
-
-```bash
-node <<'NODE'
-(async () => {
-  const response = await fetch('http://localhost:5000/generate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: 'SELECT * FROM lineitem LIMIT 1', predicates: [] }),
-  });
-  const body = await response.json();
-  console.log(JSON.stringify(body, null, 2));
-})();
-NODE
-```
-
-## Troubleshooting
-
-- If `psql` tries to connect to a database named after your OS user, pass an explicit `-d` or a full connection string.
-- If `/generate` reports `28P01`, the PostgreSQL username/password or auth method is wrong.
-- If the optimizer works but plans look incomplete, make sure `ANALYZE` has been run after loading the data.
-- If the frontend fails to start, make sure you are using the current workspace dependencies and Node 20.
-
-## Documentation
-
-- [docs/setup-runbook.md](docs/setup-runbook.md)
-- [docs/sql-to-mongo-support.md](docs/sql-to-mongo-support.md)
-- [docs/testing-matrix.md](docs/testing-matrix.md)
-- [docs/conversion-smoke-results.md](docs/conversion-smoke-results.md)
